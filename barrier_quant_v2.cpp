@@ -11,7 +11,7 @@
 //  2. The four duplicated functions are one function: lattice_price().
 //  3. Prices are returned (not printed), so they can be tabulated.
 //  4. Extra column: QuantLib analytic price with the barrier moved to the
-//     lattice's effective barrier H_eff = S*u^{+-h}. This is the barrier the
+//     lattice's effective barrier Ht = H~_n = S*u^{+-k_n}. This is the barrier the
 //     lattice really enforces; error vs this column decays ~ O(1/n) without
 //     the Boyle-Lau oscillation.
 //  5. Options already knocked out at t=0 (S >= Hu or S <= Hd) return 0.
@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <algorithm>
 #include <iostream>
 #include <iomanip>
 #include <ql/quantlib.hpp>
@@ -40,25 +41,28 @@ enum Kind { UP, DOWN };
 
 struct Market { double S, K, r, v, q; };
 
-// Number of lattice steps h >= 1 from S to the first node that is strictly
-// beyond the barrier (paper: H(n) = floor(log(Hu/S)/log u) + 1, down: -H(n)).
-static int barrier_steps(double S, double Barrier, double u, Kind kind) {
+// Barrier index k_n >= 1: number of lattice steps from S to the first node AT or beyond the barrier
+// (paper, Section 2: k_n = ceil(log(Hu/S)/log u); down: ceil(log(S/Hd)/log u)); a node exactly on the barrier kills.
+// A ratio within 1e-12 of an integer is treated as that integer.
+static int barrier_index(double S, double Barrier, double u, Kind kind) {
     double a = (kind == UP) ? std::log(Barrier / S) / std::log(u)
                             : std::log(S / Barrier) / std::log(u);
-    return (int)std::floor(a) + 1;
+    const double k = std::round(a);
+    if (std::fabs(a - k) <= 1e-12 * std::max(1.0, std::fabs(a))) return (int)k;
+    return (int)std::ceil(a);
 }
 
 // Effective barrier enforced by the lattice (first killing node).
-static double effective_barrier(double S, double u, int h, Kind kind) {
-    return (kind == UP) ? S * std::pow(u, h) : S * std::pow(u, -h);
+static double effective_barrier(double S, double u, int kn, Kind kind) {   // Ht = H~_n
+    return (kind == UP) ? S * std::pow(u, kn) : S * std::pow(u, -kn);
 }
 
 // Closed-form lattice price:  e^{-rT} sum_j V(n,j) p^j q^{n-j} payoff
-//   up  : V = <<C(n,j) - C(n,j-h)>>
-//   down: V = <<C(n,j) - C(n,j+h)>>        (h = |H(n)|)
+//   up  : V = <<C(n,j) - C(n,j-k_n)>>
+//   down: V = <<C(n,j) - C(n,j+k_n)>>
 static double lattice_price(int n, Kind kind, bool isCall, double Barrier,
-                            const Market& m, double T, int* h_out = nullptr,
-                            double* Heff_out = nullptr) {
+                            const Market& m, double T, int* kn_out = nullptr,
+                            double* Ht_out = nullptr) {
     const double S = m.S, K = m.K, r = m.r, v = m.v;
     const double u = std::exp(v * std::sqrt(T / n)), d = 1.0 / u;
     const double p = (std::exp(r * T / n) - d) / (u - d);
@@ -66,13 +70,13 @@ static double lattice_price(int n, Kind kind, bool isCall, double Barrier,
     const double lu = std::log(u);
 
     if ((kind == UP && S >= Barrier) || (kind == DOWN && S <= Barrier)) {
-        if (h_out) *h_out = 0;
-        if (Heff_out) *Heff_out = Barrier;
+        if (kn_out) *kn_out = 0;
+        if (Ht_out) *Ht_out = Barrier;
         return 0.0;                          // knocked out at inception
     }
-    const int h = barrier_steps(S, Barrier, u, kind);
-    if (h_out) *h_out = h;
-    if (Heff_out) *Heff_out = effective_barrier(S, u, h, kind);
+    const int kn = barrier_index(S, Barrier, u, kind);
+    if (kn_out) *kn_out = kn;
+    if (Ht_out) *Ht_out = effective_barrier(S, u, kn, kind);
 
     mpf_set_default_prec(256);
     mpz_t b1, b2; mpz_init(b1); mpz_init(b2);
@@ -87,7 +91,7 @@ static double lattice_price(int n, Kind kind, bool isCall, double Barrier,
         if (payoff <= 0.0) continue;
 
         mpz_bin_uiui(b1, n, j);
-        long k = (kind == UP) ? (long)j - h : (long)j + h;   // reflected index
+        long k = (kind == UP) ? (long)j - kn : (long)j + kn;   // reflected index
         if (k >= 0 && k <= n) {
             mpz_bin_uiui(b2, n, (unsigned long)k);
             if (mpz_cmp(b1, b2) > 0) mpz_sub(b1, b1, b2);
@@ -147,13 +151,13 @@ int main(int argc, char* argv[]) {
         const double qlH = ql_price(R.kind, R.call, R.B, m, days);
         std::cout << "\n== " << R.name << "   QuantLib(H=" << R.B << ") = "
                   << std::fixed << std::setprecision(6) << qlH << "\n"
-                  << "      n    h     H_eff    lattice   lat-QL(H)   QL(H_eff)  lat-QL(H_eff)\n";
+                  << "      n   k_n       Ht    lattice   lat-QL(H)    QL(Ht)   lat-QL(Ht)\n";
         for (int n = step; n <= nmax; n += step) {
-            int h; double Heff;
-            const double lat = lattice_price(n, R.kind, R.call, R.B, m, T, &h, &Heff);
-            const double qlE = ql_price(R.kind, R.call, Heff, m, days);
+            int kn; double Ht;
+            const double lat = lattice_price(n, R.kind, R.call, R.B, m, T, &kn, &Ht);
+            const double qlE = ql_price(R.kind, R.call, Ht, m, days);
             std::printf("%7d %4d %9.4f %10.6f %+11.6f %11.6f %+13.6f\n",
-                        n, h, Heff, lat, lat - qlH, qlE, lat - qlE);
+                        n, kn, Ht, lat, lat - qlH, qlE, lat - qlE);
         }
     }
     return 0;
